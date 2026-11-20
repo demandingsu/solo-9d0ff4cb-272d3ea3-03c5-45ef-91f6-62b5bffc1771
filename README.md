@@ -32,6 +32,7 @@ EXHIBITION_DB=./exhibition.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/events` | 上报单个事件 |
 | POST | `/events/batch` | 批量上报，单事务原子提交 |
 | GET | `/visitors/{visitor_id}/path` | 查询观众参观路径 |
+| GET | `/stats/transitions?date=YYYY-MM-DD` | 按日查询「起点展品 → 终点展品」人数（可选 `from_exhibit` 过滤） |
 | POST | `/visitors/{visitor_id}/withdraw` | 撤回数据使用同意（body 可省略，或传 `{"visitor_id": "..."}`） |
 | GET | `/health` | 健康检查 |
 
@@ -58,8 +59,41 @@ HTTP 状态码：成功受理固定 `201`，具体结果看响应体 `status`；
 - 只有 close 没有 open 的孤儿事件不产生参观项
 - close 早于 open 的异常数据：保留关闭时间，但停留时长标记未知
 
-## 设计要点（如何满足需求）
+### 下一站人数（按日）
 
+`GET /stats/transitions?date=2026-11-18` 返回该 UTC 日每对相邻展品的去重观众人数：
+
+```json
+{
+  "date": "2026-11-18",
+  "from_exhibit": null,
+  "transitions": [
+    {"from_exhibit": "A", "to_exhibit": "B", "visitors": 12}
+  ]
+}
+```
+
+口径与路径查询完全一致（共用同一配对/排序实现）：
+
+- 取该观众路径上**展品不同的相邻两站**，方向为「前一站 → 后一站」。
+- 归日以**后一站（终点）的 UTC 打开日期**为准（`opened_at` 的日期部分）。
+- 同一观众同一天多次走同一方向只计 **1 人**；`visitors` 是去重观众数。
+- 查询直接读保存好的 `daily_transitions` 人数，不在读请求里重算。
+
+写入时同步维护统计，且与事件写入处于同一事务：
+
+- 单笔/批量上报只重算**受影响观众**的贡献：重建该观众路径，得出
+  `(日期, 起点, 终点)` 集合后增量刷新对应人数。乱序补报若把 A → C 拆成
+  A → B 与 B → C，只影响该观众，其他观众的人数不变；若该观众当天还走过
+  同一方向（另一对相邻站），该方向仍计一人。
+- 撤回同意时删除该观众**所有日期**的贡献并刷新对应人数。
+- 任一事件非法导致事务回滚时，路径与人数一起保持原状（批量同样整批回滚）。
+
+旧库升级：启动时 `init_db()` 在 `BEGIN IMMEDIATE` 事务里检查
+`stats_meta` 版本标记；未标记过则从 `events` 一次性重建全部历史统计并写入
+标记，多 worker 同时启动也只补一次。之后重启不再重算。
+
+## 设计要点（如何满足需求）
 1. **重传不重复计数**：`events.event_id` 为主键；插入前先查存在性，存在即返回
    `duplicate`，整段逻辑在同一事务内。
 2. **乱序补报照常处理**：路径不做物化存储，每次查询从已提交事件实时配对、排序。
@@ -78,20 +112,26 @@ HTTP 状态码：成功受理固定 `201`，具体结果看响应体 `status`；
 5. **线程/进程并发**：每请求一个独立 SQLite 连接（`check_same_thread=False`
    以适配 uvicorn 线程池，连接不在请求间共享）；多个 uvicorn worker 共享同一
    数据卷时由 SQLite 文件锁保证安全。
+6. **下一站人数不拖慢查询**：人数是事件表的派生缓存，写入时在同一事务内按
+   单观众增量刷新（`visitor_daily_transitions` 主键天然去重同人同向），
+   日查询只走 `daily_transitions` 索引；读路径无重算、无全表扫描。
 
 ## 目录结构
 
 ```
 app/
-  config.py    环境变量配置（DB 路径、busy timeout）
-  db.py        连接、schema、WAL/pragma、事务管理
-  models.py    Pydantic 请求/响应模型
-  crud.py      领域逻辑：入库去重、开关配对、路径推导、撤回
-  main.py      FastAPI 路由与生命周期
+  config.py      环境变量配置（DB 路径、busy timeout）
+  db.py          连接、schema、WAL/pragma、事务管理、启动时统计补齐
+  models.py      Pydantic 请求/响应模型
+  path.py        参观路径配对与排序（路径查询与统计共用）
+  transitions.py 每日「下一站」人数：增量重算、撤回扣减、旧库补齐
+  crud.py        领域逻辑：入库去重、路径查询、撤回
+  main.py        FastAPI 路由与生命周期
 tests/
   conftest.py
-  test_api.py      15 项功能/并发测试
-  stress_http.py   针对运行中服务的真实 HTTP 并发压测（手动运行）
+  test_api.py         15 项路径/上报/撤回功能与并发测试
+  test_transitions.py 16 项「下一站人数」口径、补报拆段、撤回、旧库补齐测试
+  stress_http.py      针对运行中服务的真实 HTTP 并发压测（手动运行）
 Dockerfile
 docker-compose.yml
 ```
@@ -107,7 +147,10 @@ pytest tests/ -v
 缺关闭标记未知及补关后转已知、孤儿 close、`event_id` 重传（含篡改内容）、
 批量去重与整批原子回滚、撤回后路径消失/重复撤回幂等/旧事件重放与新事件均被拒、
 多线程上传-查询-撤回交错（进程内 TestClient 与真实 HTTP 两种）、
-无时区时间拒绝、时区偏移归一化、负停留异常、WAL 与主键的存储层校验。
+无时区时间拒绝、时区偏移归一化、负停留异常、WAL 与主键的存储层校验；
+以及下一站人数：相邻不同展品、按终点 UTC 打开日期归日、同人同向去重、
+补报拆段后只重算该观众且仍计一人、撤回跨日期扣减、单笔/批量失败时人数不变、
+查询只读已保存人数、旧库首次启动补齐且重复启动不翻倍、跳过已撤回观众。
 
 ## 已知限制 / 未完成项
 
@@ -116,5 +159,7 @@ pytest tests/ -v
   `--workers 2` 两种方式完成功能与并发验证。
 - 同一 `page_view_id` 若出现多个 open，取最早 open；多个 close 取最早 close，
   异常上报不报错但只保留一组配对。
+- 「下一站人数」按观众逐人重算，单观众事件极多时一次上报的重算成本随之上升；
+  目前无分页/时间范围批量重建接口（只有启动时的全量补齐）。
 - 没有鉴权/限流与分页；观众号、事件号均按字符串处理，未做格式白名单。
 - 撤回是硬删除事件数据（仅保留撤回标记本身），不做审计留档。

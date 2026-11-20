@@ -1,6 +1,7 @@
 """Pydantic request/response models."""
 from __future__ import annotations
 
+from datetime import date
 from enum import Enum
 from typing import Literal
 
@@ -94,3 +95,20 @@ class WithdrawResult(BaseModel):
 
 class ErrorResponse(BaseModel):
     detail: str
+
+
+class TransitionCount(BaseModel):
+    """How many distinct visitors went from one exhibit to another."""
+
+    from_exhibit: str
+    to_exhibit: str
+    visitors: int
+
+
+class DailyTransitions(BaseModel):
+    """Next-exhibit counts for one UTC day (attributed by the destination's
+    open date). ``from_exhibit`` echoes the optional filter."""
+
+    date: date
+    from_exhibit: str | None
+    transitions: list[TransitionCount]

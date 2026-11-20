@@ -3,13 +3,15 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import asynccontextmanager
+from datetime import date
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 
-from . import crud
+from . import crud, transitions
 from .db import get_connection, init_db, write_transaction
 from .models import (
+    DailyTransitions,
     ErrorResponse,
     EventBatchIn,
     EventIn,
@@ -84,7 +86,21 @@ def post_events(
     二者在同一已提交状态上串行判定。
     """
     with write_transaction(conn):
-        results = [crud.ingest_event(conn, event) for event in batch.events]
+        results = [
+            crud.ingest_event(conn, event, recompute_stats=False)
+            for event in batch.events
+        ]
+        # One refresh per visitor whose events actually changed, after all
+        # inserts: a batch that both opens and closes a visit updates the
+        # saved counts exactly once, and any error above still rolls back
+        # events and counts together.
+        touched = {
+            event.visitor_id
+            for event, result in zip(batch.events, results)
+            if result.status == "stored"
+        }
+        for visitor_id in touched:
+            transitions.recompute_visitor(conn, visitor_id)
     accepted = sum(r.status == "stored" for r in results)
     duplicates = sum(r.status == "duplicate" for r in results)
     rejected = sum(r.status == "rejected_withdrawn" for r in results)
@@ -134,6 +150,27 @@ def post_withdraw(
         )
     with write_transaction(conn):
         return crud.withdraw_consent(conn, visitor_id)
+
+
+@app.get(
+    "/stats/transitions",
+    response_model=DailyTransitions,
+    summary="按日查询展品间下一站人数（起点 -> 终点）",
+)
+def get_daily_transitions(
+    day: date = Query(..., alias="date", description="UTC 日期，如 2026-11-18"),
+    from_exhibit: str | None = Query(
+        None, min_length=1, description="可选：只看从该展品出发的下一站"
+    ),
+    conn: sqlite3.Connection = Depends(get_connection),
+) -> DailyTransitions:
+    """返回该 UTC 日各「起点展品 -> 终点展品」的去重观众人数。
+
+    口径沿用参观路径：取同一观众路径上展品不同的相邻两站，按后一站
+    （终点）的 UTC 打开日期归日；同一观众当天多次走同一方向只计一人。
+    直接读已保存的人数，不在此请求内重算；历史数据在数据库首次启动时补齐。
+    """
+    return transitions.get_daily(conn, day.isoformat(), from_exhibit)
 
 
 @app.get("/health", summary="健康检查")

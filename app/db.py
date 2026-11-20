@@ -41,6 +41,36 @@ CREATE TABLE IF NOT EXISTS withdrawals (
     visitor_id  TEXT    NOT NULL PRIMARY KEY,
     withdrawn_at TEXT   NOT NULL
 );
+
+-- Derived "next exhibit" statistics. One row per visitor per day per
+-- direction collapses repeat walks by the same person on the same day.
+CREATE TABLE IF NOT EXISTS visitor_daily_transitions (
+    day          TEXT NOT NULL,
+    from_exhibit TEXT NOT NULL,
+    to_exhibit   TEXT NOT NULL,
+    visitor_id   TEXT NOT NULL,
+    PRIMARY KEY (day, from_exhibit, to_exhibit, visitor_id)
+);
+-- Recomputation and withdrawal look up / delete a single visitor's rows.
+CREATE INDEX IF NOT EXISTS idx_visitor_daily_transitions_visitor
+    ON visitor_daily_transitions (visitor_id);
+
+-- Saved visitor counts read by the daily query API.
+CREATE TABLE IF NOT EXISTS daily_transitions (
+    day          TEXT    NOT NULL,
+    from_exhibit TEXT    NOT NULL,
+    to_exhibit   TEXT    NOT NULL,
+    visitors     INTEGER NOT NULL CHECK (visitors >= 0),
+    PRIMARY KEY (day, from_exhibit, to_exhibit)
+);
+CREATE INDEX IF NOT EXISTS idx_daily_transitions_from
+    ON daily_transitions (day, from_exhibit);
+
+-- Startup markers (e.g. which derivation version the stats were built with).
+CREATE TABLE IF NOT EXISTS stats_meta (
+    key   TEXT NOT NULL PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -66,10 +96,18 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
 
 
 def init_db(db_path: str | None = None) -> None:
-    """Create tables and indexes if they do not yet exist."""
+    """Create tables and indexes if they do not yet exist.
+
+    Also upgrades a legacy database on its first startup: statistics tables
+    are created empty and then backfilled from the stored event history, so
+    the daily query has data without replaying old reports.
+    """
+    from .transitions import ensure_stats_ready
+
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        ensure_stats_ready(conn)
     finally:
         conn.close()
 

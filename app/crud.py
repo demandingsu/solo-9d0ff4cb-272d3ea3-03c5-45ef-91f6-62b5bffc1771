@@ -12,10 +12,11 @@ from datetime import datetime, timezone
 from .models import (
     EventIn,
     IngestResult,
-    Visit,
     VisitPath,
     WithdrawResult,
 )
+from .path import pair_visits
+from . import transitions
 
 
 class BadEventTime(ValueError):
@@ -49,13 +50,19 @@ def is_withdrawn(conn: sqlite3.Connection, visitor_id: str) -> bool:
     return row is not None
 
 
-def ingest_event(conn: sqlite3.Connection, event: EventIn) -> IngestResult:
+def ingest_event(
+    conn: sqlite3.Connection, event: EventIn, *, recompute_stats: bool = True
+) -> IngestResult:
     """Store one event. Must be called inside a write transaction.
 
     Returns ``duplicate`` when ``event_id`` already exists (idempotent
     replay, payload differences are ignored), and ``rejected_withdrawn``
     when the visitor has withdrawn consent — such events are never stored
     and therefore can never resurrect a deleted path.
+
+    ``recompute_stats`` lets a batch caller defer the per-visitor statistics
+    refresh until all of the batch's events are inserted, so one visitor's
+    path is scanned once per batch rather than once per event.
     """
     if is_withdrawn(conn, event.visitor_id):
         return IngestResult(event_id=event.event_id, status="rejected_withdrawn")
@@ -87,62 +94,11 @@ def ingest_event(conn: sqlite3.Connection, event: EventIn) -> IngestResult:
             utc_now_iso(),
         ),
     )
+    # Same transaction as the insert: the visitor's saved transition counts
+    # either reflect this event or the event is rolled back with them.
+    if recompute_stats:
+        transitions.recompute_visitor(conn, event.visitor_id)
     return IngestResult(event_id=event.event_id, status="stored")
-
-
-def _pair_visits(rows: list[sqlite3.Row]) -> list[Visit]:
-    """Pair open/close rows by page_view_id and order the resulting path."""
-    opens: dict[str, sqlite3.Row] = {}
-    closes: dict[str, list[sqlite3.Row]] = {}
-
-    for row in rows:
-        bucket = opens if row["event_type"] == "open" else closes
-        if row["event_type"] == "open":
-            # Keep the earliest open if a page view ever reports more than one.
-            if row["page_view_id"] not in bucket or row["event_time"] < bucket[row["page_view_id"]]["event_time"]:
-                bucket[row["page_view_id"]] = row
-        else:
-            closes.setdefault(row["page_view_id"], []).append(row)
-
-    visits: list[Visit] = []
-    for page_view_id, open_row in opens.items():
-        opened_at = open_row["event_time"]
-        close_rows = closes.get(page_view_id, [])
-        # Earliest close for this page view.
-        close_row = min(close_rows, key=lambda r: r["event_time"]) if close_rows else None
-
-        closed_at = close_row["event_time"] if close_row is not None else None
-        dwell_seconds: float | None = None
-        dwell_known = False
-
-        if closed_at is not None:
-            open_dt = datetime.fromisoformat(opened_at)
-            close_dt = datetime.fromisoformat(closed_at)
-            delta = (close_dt - open_dt).total_seconds()
-            if delta >= 0:
-                dwell_seconds = round(delta, 3)
-                dwell_known = True
-            # delta < 0: close earlier than its own open — anomalous input,
-            # closed_at is returned but stay duration is treated as unknown.
-
-        visits.append(
-            Visit(
-                page_view_id=page_view_id,
-                exhibit_id=open_row["exhibit_id"],
-                opened_at=opened_at,
-                closed_at=closed_at,
-                dwell_seconds=dwell_seconds,
-                dwell_known=dwell_known,
-                sequence=0,  # assigned after sorting
-            )
-        )
-
-    # Path order = open time. A late-arriving earlier open therefore simply
-    # re-sorts the path on the next query; nothing about the order is stored.
-    visits.sort(key=lambda v: (v.opened_at, v.page_view_id))
-    for index, visit in enumerate(visits, start=1):
-        visit.sequence = index
-    return visits
 
 
 def get_visitor_path(conn: sqlite3.Connection, visitor_id: str) -> VisitPath:
@@ -172,7 +128,7 @@ def get_visitor_path(conn: sqlite3.Connection, visitor_id: str) -> VisitPath:
             """,
             (visitor_id,),
         ).fetchall()
-        visits = _pair_visits(rows)
+        visits = pair_visits(rows)
         conn.rollback()  # read-only snapshot; nothing to commit
         return VisitPath(
             visitor_id=visitor_id,
@@ -204,6 +160,9 @@ def withdraw_consent(conn: sqlite3.Connection, visitor_id: str) -> WithdrawResul
         """,
         (visitor_id, utc_now_iso()),
     )
+    # Remove the visitor's contribution from every day in the same
+    # transaction as the event deletion.
+    transitions.remove_visitor(conn, visitor_id)
     return WithdrawResult(
         visitor_id=visitor_id,
         consent_withdrawn=True,
